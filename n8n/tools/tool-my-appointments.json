@@ -1,0 +1,78 @@
+{
+  "name": "Ferramenta: get_my_appointments",
+  "nodes": [
+    {
+      "id": "t0060001-0000-4000-8000-000000000001",
+      "name": "Disparar get_my_appointments",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1,
+      "position": [0, 0],
+      "parameters": {},
+      "notes": "Entrada da ferramenta get_my_appointments (§4). Argumentos: { wa_id }."
+    },
+    {
+      "id": "t0060002-0000-4000-8000-000000000002",
+      "name": "Buscar Meus Agendamentos",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [250, 0],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT a.id AS appointment_id, s.name AS service_name, a.start_at, a.status FROM appointments a JOIN services s ON s.id = a.service_id WHERE a.client_id = (SELECT id FROM clients WHERE wa_id = $1) AND a.status IN ('scheduled','confirmed') ORDER BY a.start_at DESC LIMIT 20",
+        "queryParameters": {
+          "values": [
+            { "parameterType": "expression", "value": "={{ $json.wa_id }}" }
+          ]
+        },
+        "options": {}
+      },
+      "credentials": { "postgres": { "id": "__CRED_POSTGRES_ID__", "name": "Postgres Barbearia" } },
+      "notes": "Lista os agendamentos ativos do cliente (§6): subconsulta por wa_id em clients, JOIN com services, máximo 20, mais recentes primeiro."
+    },
+    {
+      "id": "t0060003-0000-4000-8000-000000000003",
+      "name": "Montar Retorno",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [500, 0],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Formata o contrato da §4: { appointments: [{ appointment_id, service_name, start_at, status }] }\nconst linhas = $input.all().map(i => i.json);\nconst appointments = linhas.map(r => ({\n  appointment_id: r.appointment_id,\n  service_name: r.service_name,\n  start_at: r.start_at,\n  status: r.status\n}));\nreturn [{ json: { appointments } }];"
+      },
+      "notes": "Normaliza os campos vindos do JOIN para a forma esperada pela ferramenta."
+    },
+    {
+      "id": "t0060004-0000-4000-8000-000000000004",
+      "name": "Retorno get_my_appointments",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [750, 0],
+      "parameters": {
+        "mode": "manual",
+        "assignments": {
+          "assignments": [
+            { "id": "s1", "name": "appointments", "value": "={{ $json.appointments }}", "type": "array" }
+          ]
+        },
+        "options": {}
+      },
+      "notes": "Nó final; devolve { appointments: [...] } conforme §4."
+    }
+  ],
+  "connections": {
+    "Main": {
+      "Disparar get_my_appointments": [
+        [{ "node": "Buscar Meus Agendamentos", "type": "Main", "index": 0 }]
+      ],
+      "Buscar Meus Agendamentos": [
+        [{ "node": "Montar Retorno", "type": "Main", "index": 0 }]
+      ],
+      "Montar Retorno": [
+        [{ "node": "Retorno get_my_appointments", "type": "Main", "index": 0 }]
+      ]
+    }
+  },
+  "active": false,
+  "settings": { "executionOrder": "v1" },
+  "pinData": {}
+}

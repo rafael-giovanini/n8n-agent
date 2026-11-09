@@ -1,0 +1,76 @@
+{
+  "name": "Ferramenta: list_services",
+  "nodes": [
+    {
+      "id": "t0010001-0000-4000-8000-000000000001",
+      "name": "Disparar list_services",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1,
+      "position": [0, 0],
+      "parameters": {},
+      "notes": "Ponto de entrada do sub-workflow chamado pela ferramenta toolWorkflow no fluxo principal (§6). Recebe os argumentos da função list_services (§4): { }."
+    },
+    {
+      "id": "t0010002-0000-4000-8000-000000000002",
+      "name": "Buscar Serviços Ativos",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [260, 0],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT id, name, description, duration_minutes, price FROM services WHERE active = true ORDER BY id",
+        "queryParameters": { "values": [] },
+        "options": {}
+      },
+      "credentials": {
+        "postgres": { "id": "__CRED_POSTGRES_ID__", "name": "Postgres Barbearia" }
+      },
+      "notes": "Lista apenas serviços ativos (§6). Requer a credencial 'Postgres Barbearia' (tipo postgres)."
+    },
+    {
+      "id": "t0010003-0000-4000-8000-000000000003",
+      "name": "Montar Lista de Serviços",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [520, 0],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Converte as linhas do banco no contrato de retorno §4: { services: [...] }\nconst linhas = $input.all().map(i => i.json);\nconst services = linhas.map(r => ({\n  service_id: r.id,\n  name: r.name,\n  description: r.description || '',\n  duration_minutes: r.duration_minutes,\n  price: Number(r.price).toFixed(2)\n}));\nreturn [{ json: { services } }];"
+      },
+      "notes": "Formata o preço com duas casas e renomeia id para service_id, conforme a tabela de retorno da §4."
+    },
+    {
+      "id": "t0010004-0000-4000-8000-000000000004",
+      "name": "Retorno list_services",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [780, 0],
+      "parameters": {
+        "mode": "manual",
+        "assignments": {
+          "assignments": [
+            { "id": "s1", "name": "services", "value": "={{ $json.services }}", "type": "array" }
+          ]
+        },
+        "options": {}
+      },
+      "notes": "Nó final do sub-workflow; devolve o JSON { services: [...] } definido na §4 do contrato."
+    }
+  ],
+  "connections": {
+    "Main": {
+      "Disparar list_services": [
+        [{ "node": "Buscar Serviços Ativos", "type": "Main", "index": 0 }]
+      ],
+      "Buscar Serviços Ativos": [
+        [{ "node": "Montar Lista de Serviços", "type": "Main", "index": 0 }]
+      ],
+      "Montar Lista de Serviços": [
+        [{ "node": "Retorno list_services", "type": "Main", "index": 0 }]
+      ]
+    }
+  },
+  "active": false,
+  "settings": { "executionOrder": "v1" },
+  "pinData": {}
+}

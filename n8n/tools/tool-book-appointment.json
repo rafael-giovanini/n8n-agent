@@ -1,0 +1,311 @@
+{
+  "name": "Ferramenta: book_appointment",
+  "nodes": [
+    {
+      "id": "t0030001-0000-4000-8000-000000000001",
+      "name": "Disparar book_appointment",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1,
+      "position": [0, 0],
+      "parameters": {},
+      "notes": "Entrada da ferramenta book_appointment (§4). Argumentos: { wa_id, client_name, service_id, barber_id (nulo ok), start_at ISO-8601 }."
+    },
+    {
+      "id": "t0030002-0000-4000-8000-000000000002",
+      "name": "Validar Dados Iniciais",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [250, 0],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Normaliza os argumentos e rejeita horários no passado (reason 'passado').\nconst a = $input.first().json || {};\nconst start_at = a.start_at || null;\nlet futuro = true;\nif (start_at) { futuro = new Date(start_at) > new Date(); }\nconst barber_id = (a.barber_id === null || a.barber_id === undefined || a.barber_id === '') ? null : a.barber_id;\nreturn [{ json: {\n  wa_id: a.wa_id,\n  client_name: a.client_name || '',\n  service_id: a.service_id ?? null,\n  barber_id,\n  start_at,\n  futuro\n} }];"
+      },
+      "notes": "Primeira barreira: horário sem data ou no passado retorna reason 'passado' (§4)."
+    },
+    {
+      "id": "t0030003-0000-4000-8000-000000000003",
+      "name": "Buscar Serviço",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [500, -140],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT id, name, duration_minutes FROM services WHERE id = $1 AND active = true",
+        "queryParameters": {
+          "values": [
+            { "parameterType": "expression", "value": "={{ $('Validar Dados Iniciais').first().json.service_id }}" }
+          ]
+        },
+        "options": {}
+      },
+      "credentials": { "postgres": { "id": "__CRED_POSTGRES_ID__", "name": "Postgres Barbearia" } },
+      "notes": "Confirma o serviço ativo e obtém duration_minutes para calcular end_at."
+    },
+    {
+      "id": "t0030004-0000-4000-8000-000000000004",
+      "name": "Buscar Expediente do Horário",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [500, 60],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT closed, open_time, close_time, break_start, break_end FROM working_hours WHERE day_of_week = EXTRACT(DOW FROM $1::date)",
+        "queryParameters": {
+          "values": [
+            { "parameterType": "expression", "value": "={{ $('Validar Dados Iniciais').first().json.start_at }}" }
+          ]
+        },
+        "options": {}
+      },
+      "credentials": { "postgres": { "id": "__CRED_POSTGRES_ID__", "name": "Postgres Barbearia" } },
+      "notes": "Expediente do dia do agendamento; o SQL deriva o dia da semana diretamente do start_at."
+    },
+    {
+      "id": "t0030005-0000-4000-8000-000000000005",
+      "name": "Validar Janela e Calcular Fim",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [760, 0],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Valida janela no expediente e calcula end_at = start_at + duration_minutes.\nconst v = $('Validar Dados Iniciais').first().json;\nconst base = { wa_id: v.wa_id, client_name: v.client_name, service_id: v.service_id, barber_id: v.barber_id, start_at: v.start_at };\nif (!v.start_at) return [{ json: { ...base, ok: false, reason: 'fora-expediente' } }];\nif (!v.futuro) return [{ json: { ...base, ok: false, reason: 'passado' } }];\nconst serv = $('Buscar Serviço').first().json;\nif (!serv || !serv.duration_minutes) return [{ json: { ...base, ok: false, reason: 'duracao-indisponivel' } }];\nconst exp = $('Buscar Expediente do Horário').first().json;\nif (!exp || exp.closed) return [{ json: { ...base, ok: false, reason: 'fora-expediente', duration_minutes: serv.duration_minutes } }];\nfunction paraMin(t) { if (!t) return null; const p = String(t).split(':').map(Number); return p[0] * 60 + p[1]; }\nconst start = new Date(v.start_at);\nconst end = new Date(start.getTime() + Number(serv.duration_minutes) * 60000);\nconst sMin = start.getHours() * 60 + start.getMinutes();\nconst eMin = end.getHours() * 60 + end.getMinutes();\nconst openM = paraMin(exp.open_time);\nconst closeM = paraMin(exp.close_time);\nif (sMin < openM || eMin > closeM) return [{ json: { ...base, ok: false, reason: 'duracao-indisponivel', duration_minutes: serv.duration_minutes } }];\nconst bIni = paraMin(exp.break_start);\nconst bFim = paraMin(exp.break_end);\nif (bIni !== null && bFim !== null && sMin < bFim && eMin > bIni) return [{ json: { ...base, ok: false, reason: 'fora-expediente', duration_minutes: serv.duration_minutes } }];\nreturn [{ json: { ...base, ok: true, reason: null, duration_minutes: serv.duration_minutes, service_name: serv.name, end_at: end.toISOString() } }];"
+      },
+      "notes": "Motivos possíveis (§4): fora-expediente, passado, duracao-indisponivel. Quando ok, expõe end_at calculado."
+    },
+    {
+      "id": "t0030006-0000-4000-8000-000000000006",
+      "name": "Pode Gravar?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [1010, 0],
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "combinator": "and",
+          "conditions": [
+            { "id": "c1", "leftValue": "={{ $json.ok }}", "type": "boolean", "operation": "true", "rightValue": "" }
+          ]
+        },
+        "options": {}
+      },
+      "notes": "true = janela válida, seguir para cadastro do cliente e agendamento; false = devolver motivo de erro."
+    },
+    {
+      "id": "t0030007-0000-4000-8000-000000000007",
+      "name": "Retorno Erro Booking",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [1250, 220],
+      "parameters": {
+        "mode": "manual",
+        "assignments": {
+          "assignments": [
+            { "id": "e1", "name": "ok", "value": "={{ $json.ok }}", "type": "boolean" },
+            { "id": "e2", "name": "reason", "value": "={{ $json.reason }}", "type": "string" }
+          ]
+        },
+        "options": {}
+      },
+      "notes": "Retorno { ok:false, reason } quando a janela é inválida (§4)."
+    },
+    {
+      "id": "t0030008-0000-4000-8000-000000000008",
+      "name": "Upsert Cliente",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [1250, -120],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO clients (wa_id, name, phone, created_at, updated_at) VALUES ($1, $2, $3, now(), now()) ON CONFLICT (wa_id) DO UPDATE SET name = COALESCE(EXCLUDED.name, clients.name), updated_at = now() RETURNING id",
+        "queryParameters": {
+          "values": [
+            { "parameterType": "expression", "value": "={{ $('Validar Janela e Calcular Fim').first().json.wa_id }}" },
+            { "parameterType": "expression", "value": "={{ $('Validar Janela e Calcular Fim').first().json.client_name || null }}" },
+            { "parameterType": "expression", "value": "={{ null }}" }
+          ]
+        },
+        "options": {}
+      },
+      "credentials": { "postgres": { "id": "__CRED_POSTGRES_ID__", "name": "Postgres Barbearia" } },
+      "notes": "Cria ou atualiza o cliente por wa_id (§4) e devolve o id para o agendamento."
+    },
+    {
+      "id": "t0030009-0000-4000-8000-000000000009",
+      "name": "Verificar Conflito",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [1490, -120],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT id FROM appointments WHERE status IN ('scheduled','confirmed') AND COALESCE(barber_id, 0) = COALESCE($3::integer, 0) AND tstzrange(start_at, end_at, '[)') && tstzrange($1::timestamptz, $2::timestamptz, '[)') LIMIT 1",
+        "queryParameters": {
+          "values": [
+            { "parameterType": "expression", "value": "={{ $('Validar Janela e Calcular Fim').first().json.start_at }}" },
+            { "parameterType": "expression", "value": "={{ $('Validar Janela e Calcular Fim').first().json.end_at }}" },
+            { "parameterType": "expression", "value": "={{ $('Validar Janela e Calcular Fim').first().json.barber_id }}" }
+          ]
+        },
+        "options": {}
+      },
+      "credentials": { "postgres": { "id": "__CRED_POSTGRES_ID__", "name": "Postgres Barbearia" } },
+      "notes": "Pré-checagem espelho da exclusão gist do schema (§3): sobreposição com agendamento ativo vira reason 'conflito' antes do INSERT."
+    },
+    {
+      "id": "t003000a-0000-4000-8000-00000000000a",
+      "name": "Decisão Conflito",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1730, -120],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Consome o cliente recém-upsertado e a pré-checagem de conflito (espelho da EXCLUDE gist).\nconst valid = $('Validar Janela e Calcular Fim').first().json;\nconst cliente = $('Upsert Cliente').first().json || {};\nconst conflito = $('Verificar Conflito').first().json || null;\nconst motivo = (conflito && conflito.id) ? 'conflito' : null;\nreturn [{ json: { ...valid, client_id: cliente.id, motivo } }];"
+      },
+      "notes": "Se houver linha em Verificar Conflito, motivo='conflito'; caso contrário segue para o INSERT."
+    },
+    {
+      "id": "t003000b-0000-4000-8000-00000000000b",
+      "name": "Conflito de Horário?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [1970, -120],
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "combinator": "and",
+          "conditions": [
+            { "id": "c1", "leftValue": "={{ $json.motivo }}", "type": "string", "operation": "notEmpty", "rightValue": "" }
+          ]
+        },
+        "options": {}
+      },
+      "notes": "true = conflito, devolver { ok:false, reason:'conflito' }; false = inserir o agendamento."
+    },
+    {
+      "id": "t003000c-0000-4000-8000-00000000000c",
+      "name": "Retorno Conflito",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [2210, 40],
+      "parameters": {
+        "mode": "manual",
+        "assignments": {
+          "assignments": [
+            { "id": "f1", "name": "ok", "value": "false", "type": "boolean" },
+            { "id": "f2", "name": "reason", "value": "={{ $json.motivo }}", "type": "string" }
+          ]
+        },
+        "options": {}
+      },
+      "notes": "Retorno de conflito: { ok:false, reason:'conflito' } (§4)."
+    },
+    {
+      "id": "t003000d-0000-4000-8000-00000000000d",
+      "name": "Inserir Agendamento",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [2210, -220],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO appointments (client_id, service_id, barber_id, start_at, end_at, status, calendar_sync_status, note) VALUES ($1, $2, $3, $4, $5, 'scheduled', 'pending', $6) RETURNING id",
+        "queryParameters": {
+          "values": [
+            { "parameterType": "expression", "value": "={{ $json.client_id }}" },
+            { "parameterType": "expression", "value": "={{ $json.service_id }}" },
+            { "parameterType": "expression", "value": "={{ $json.barber_id }}" },
+            { "parameterType": "expression", "value": "={{ $json.start_at }}" },
+            { "parameterType": "expression", "value": "={{ $json.end_at }}" },
+            { "parameterType": "expression", "value": "={{ null }}" }
+          ]
+        },
+        "options": {}
+      },
+      "credentials": { "postgres": { "id": "__CRED_POSTGRES_ID__", "name": "Postgres Barbearia" } },
+      "notes": "INSERT com status 'scheduled' e calendar_sync_status='pending' (§4); o Google Calendar é criado depois pelo workflow de sincronização. A EXCLUDE gist do schema é a garantia final anti-sobreposição."
+    },
+    {
+      "id": "t003000e-0000-4000-8000-00000000000e",
+      "name": "Montar Retorno Agendamento",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2450, -220],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Monta o retorno de sucesso da §4.\nconst linha = $('Inserir Agendamento').first().json || {};\nconst valid = $('Validar Janela e Calcular Fim').first().json;\nreturn [{ json: { ok: true, appointment_id: linha.id, start_at: valid.start_at, end_at: valid.end_at } }];"
+      },
+      "notes": "Retorno { ok:true, appointment_id, start_at, end_at }."
+    },
+    {
+      "id": "t003000f-0000-4000-8000-00000000000f",
+      "name": "Retorno Sucesso Booking",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [2690, -220],
+      "parameters": {
+        "mode": "manual",
+        "assignments": {
+          "assignments": [
+            { "id": "g1", "name": "ok", "value": "={{ $json.ok }}", "type": "boolean" },
+            { "id": "g2", "name": "appointment_id", "value": "={{ $json.appointment_id }}", "type": "number" },
+            { "id": "g3", "name": "start_at", "value": "={{ $json.start_at }}", "type": "string" },
+            { "id": "g4", "name": "end_at", "value": "={{ $json.end_at }}", "type": "string" }
+          ]
+        },
+        "options": {}
+      },
+      "notes": "Nó final de sucesso da ferramenta book_appointment."
+    }
+  ],
+  "connections": {
+    "Main": {
+      "Disparar book_appointment": [
+        [{ "node": "Validar Dados Iniciais", "type": "Main", "index": 0 }]
+      ],
+      "Validar Dados Iniciais": [
+        [{ "node": "Buscar Serviço", "type": "Main", "index": 0 }]
+      ],
+      "Buscar Serviço": [
+        [{ "node": "Buscar Expediente do Horário", "type": "Main", "index": 0 }]
+      ],
+      "Buscar Expediente do Horário": [
+        [{ "node": "Validar Janela e Calcular Fim", "type": "Main", "index": 0 }]
+      ],
+      "Validar Janela e Calcular Fim": [
+        [{ "node": "Pode Gravar?", "type": "Main", "index": 0 }]
+      ],
+      "Pode Gravar": {
+        "true": [
+          [{ "node": "Upsert Cliente", "type": "Main", "index": 0 }]
+        ],
+        "false": [
+          [{ "node": "Retorno Erro Booking", "type": "Main", "index": 0 }]
+        ]
+      },
+      "Upsert Cliente": [
+        [{ "node": "Verificar Conflito", "type": "Main", "index": 0 }]
+      ],
+      "Verificar Conflito": [
+        [{ "node": "Decisão Conflito", "type": "Main", "index": 0 }]
+      ],
+      "Decisão Conflito": [
+        [{ "node": "Conflito de Horário?", "type": "Main", "index": 0 }]
+      ],
+      "Conflito de Horário?": {
+        "true": [
+          [{ "node": "Retorno Conflito", "type": "Main", "index": 0 }]
+        ],
+        "false": [
+          [{ "node": "Inserir Agendamento", "type": "Main", "index": 0 }]
+        ]
+      },
+      "Inserir Agendamento": [
+        [{ "node": "Montar Retorno Agendamento", "type": "Main", "index": 0 }]
+      ],
+      "Montar Retorno Agendamento": [
+        [{ "node": "Retorno Sucesso Booking", "type": "Main", "index": 0 }]
+      ]
+    }
+  },
+  "active": false,
+  "settings": { "executionOrder": "v1" },
+  "pinData": {}
+}

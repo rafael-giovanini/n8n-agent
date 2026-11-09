@@ -1,0 +1,23 @@
+# Segredos e configurações locais
+.env
+.env.*
+!.env.example
+**/.env
+**/.env.*
+!**/.env.example
+
+# Sessão/autenticação WhatsApp (NUNCA versionar)
+bridge/session/*
+!bridge/session/.gitkeep
+
+# Dependências e artefatos
+node_modules/
+**/node_modules/
+.n8n/
+**/.n8n/
+pg_data/
+n8n_data/
+*.log
+npm-debug.log*
+.DS_Store
+Thumbs.db

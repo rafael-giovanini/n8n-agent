@@ -1,0 +1,141 @@
+{
+  "name": "Ferramenta: get_available_slots",
+  "nodes": [
+    {
+      "id": "t0020001-0000-4000-8000-000000000001",
+      "name": "Disparar get_available_slots",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1,
+      "position": [0, 0],
+      "parameters": {},
+      "notes": "Entrada da ferramenta get_available_slots (§4). Argumentos esperados: { service_id, date 'YYYY-MM-DD', barber_id (pode ser nulo) }."
+    },
+    {
+      "id": "t0020002-0000-4000-8000-000000000002",
+      "name": "Preparar Parâmetros da Data",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [260, 0],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Normaliza argumentos e calcula o dia da semana (0=domingo…6=sábado) da data solicitada.\nconst a = $input.first().json || {};\nconst date = a.date || new Date().toISOString().slice(0, 10);\nconst barber_id = (a.barber_id === null || a.barber_id === undefined || a.barber_id === '') ? null : a.barber_id;\nconst dataRef = new Date(date + 'T12:00:00');\nconst day_of_week = dataRef.getDay();\nconst agora = new Date();\nconst hojeLocal = agora.getFullYear() + '-' + String(agora.getMonth() + 1).padStart(2, '0') + '-' + String(agora.getDate()).padStart(2, '0');\nreturn [{ json: {\n  date,\n  service_id: a.service_id ?? null,\n  barber_id,\n  day_of_week,\n  dayStartIso: date + 'T00:00:00-03:00',\n  nowIso: agora.toISOString(),\n  isToday: date === hojeLocal\n} }];"
+      },
+      "notes": "Gera o dia da semana, o início do dia em ISO e a flag de hoje (para descartar horários passados na data de hoje)."
+    },
+    {
+      "id": "t0020003-0000-4000-8000-000000000003",
+      "name": "Buscar Duração do Serviço",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [520, -160],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT id, name, duration_minutes FROM services WHERE id = $1 AND active = true",
+        "queryParameters": {
+          "values": [
+            { "parameterType": "expression", "value": "={{ $('Preparar Parâmetros da Data').first().json.service_id }}" }
+          ]
+        },
+        "options": {}
+      },
+      "credentials": { "postgres": { "id": "__CRED_POSTGRES_ID__", "name": "Postgres Barbearia" } },
+      "notes": "Duração do serviço (§4): o slot só é oferecido se a janela inteira (start_at + duration_minutes) couber no expediente."
+    },
+    {
+      "id": "t0020004-0000-4000-8000-000000000004",
+      "name": "Buscar Expediente do Dia",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [520, 0],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT day_of_week, closed, open_time, close_time, break_start, break_end, slot_interval_minutes FROM working_hours WHERE day_of_week = $1",
+        "queryParameters": {
+          "values": [
+            { "parameterType": "expression", "value": "={{ $('Preparar Parâmetros da Data').first().json.day_of_week }}" }
+          ]
+        },
+        "options": {}
+      },
+      "credentials": { "postgres": { "id": "__CRED_POSTGRES_ID__", "name": "Postgres Barbearia" } },
+      "notes": "Expediente do dia: fechado? abertura/fechamento, intervalo de almoço e granularidade dos slots (working_hours, §3.1)."
+    },
+    {
+      "id": "t0020005-0000-4000-8000-000000000005",
+      "name": "Buscar Agendamentos do Dia",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [520, 160],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT start_at, end_at, barber_id FROM appointments WHERE status IN ('scheduled','confirmed') AND start_at >= $1::timestamptz AND start_at < ($1::date + INTERVAL '1 day')::timestamptz AND ($2::integer IS NULL OR barber_id = $2::integer)",
+        "queryParameters": {
+          "values": [
+            { "parameterType": "expression", "value": "={{ $('Preparar Parâmetros da Data').first().json.dayStartIso }}" },
+            { "parameterType": "expression", "value": "={{ $('Preparar Parâmetros da Data').first().json.barber_id }}" }
+          ]
+        },
+        "options": {}
+      },
+      "credentials": { "postgres": { "id": "__CRED_POSTGRES_ID__", "name": "Postgres Barbearia" } },
+      "notes": "Agendamentos ativos (scheduled/confirmed) do dia para descontar sobreposições; quando barber_id é nulo, considera a casa inteira."
+    },
+    {
+      "id": "t0020006-0000-4000-8000-000000000006",
+      "name": "Calcular Slots Disponíveis",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [800, 0],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Regras de slots (§4): working_hours, intervalo de almoço, horários passados,\n// duração do serviço e sobreposição com agendamentos ativos.\nconst prep = $('Preparar Parâmetros da Data').first().json;\nconst servico = $('Buscar Duração do Serviço').first().json || {};\nconst expediente = $('Buscar Expediente do Dia').first().json || null;\nconst agendamentos = $('Buscar Agendamentos do Dia').all().map(i => i.json);\n\nconst nomesFechado = ['Fechado aos domingos', 'Fechado às segundas-feiras', 'Fechado às terças-feiras', 'Fechado às quartas-feiras', 'Fechado às quintas-feiras', 'Fechado às sextas-feiras', 'Fechado aos sábados'];\n\nif (!expediente) {\n  return [{ json: { date: prep.date, closed: true, slots: [], reason: 'Dia sem expediente cadastrado na tabela working_hours.' } }];\n}\nif (expediente.closed) {\n  return [{ json: { date: prep.date, closed: true, slots: [], reason: nomesFechado[expediente.day_of_week] } }];\n}\nfunction paraMinutos(t) { if (!t) return null; const p = String(t).split(':').map(Number); return p[0] * 60 + p[1]; }\nconst openMin = paraMinutos(expediente.open_time);\nconst closeMin = paraMinutos(expediente.close_time);\nconst breakIni = paraMinutos(expediente.break_start);\nconst breakFim = paraMinutos(expediente.break_end);\nconst step = Number(expediente.slot_interval_minutes || 30);\nconst duracao = Number(servico.duration_minutes || 30);\nconst agora = new Date(prep.nowIso);\nconst slots = [];\nfor (let t = openMin; t + duracao <= closeMin; t += step) {\n  const fim = t + duracao;\n  if (breakIni !== null && breakFim !== null && t < breakFim && fim > breakIni) continue;\n  if (prep.isToday) {\n    const agoraMin = agora.getHours() * 60 + agora.getMinutes();\n    if (t <= agoraMin) continue;\n  }\n  let ocupado = false;\n  for (const a of agendamentos) {\n    if (prep.barber_id && a.barber_id && Number(a.barber_id) !== Number(prep.barber_id)) continue;\n    const s = new Date(a.start_at); const e = new Date(a.end_at);\n    const sMin = s.getHours() * 60 + s.getMinutes();\n    const eMin = e.getHours() * 60 + e.getMinutes();\n    if (t < eMin && fim > sMin) { ocupado = true; break; }\n  }\n  if (ocupado) continue;\n  const hh = String(Math.floor(t / 60)).padStart(2, '0');\n  const mm = String(t % 60).padStart(2, '0');\n  slots.push(hh + ':' + mm);\n}\nreturn [{ json: { date: prep.date, closed: false, slots, reason: null } }];"
+      },
+      "notes": "Cálculo em JS (§6): respeita closed/open/close/break, remove horários passados, exige janela inteira da duração e remove slots sobrepostos a agendamentos ativos."
+    },
+    {
+      "id": "t0020007-0000-4000-8000-000000000007",
+      "name": "Retorno get_available_slots",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [1060, 0],
+      "parameters": {
+        "mode": "manual",
+        "assignments": {
+          "assignments": [
+            { "id": "s1", "name": "date", "value": "={{ $json.date }}", "type": "string" },
+            { "id": "s2", "name": "closed", "value": "={{ $json.closed }}", "type": "boolean" },
+            { "id": "s3", "name": "slots", "value": "={{ $json.slots }}", "type": "array" },
+            { "id": "s4", "name": "reason", "value": "={{ $json.reason }}", "type": "string" }
+          ]
+        },
+        "options": {}
+      },
+      "notes": "Devolve o contrato da §4: { date, closed, slots, reason }."
+    }
+  ],
+  "connections": {
+    "Main": {
+      "Disparar get_available_slots": [
+        [{ "node": "Preparar Parâmetros da Data", "type": "Main", "index": 0 }]
+      ],
+      "Preparar Parâmetros da Data": [
+        [{ "node": "Buscar Duração do Serviço", "type": "Main", "index": 0 }]
+      ],
+      "Buscar Duração do Serviço": [
+        [{ "node": "Buscar Expediente do Dia", "type": "Main", "index": 0 }]
+      ],
+      "Buscar Expediente do Dia": [
+        [{ "node": "Buscar Agendamentos do Dia", "type": "Main", "index": 0 }]
+      ],
+      "Buscar Agendamentos do Dia": [
+        [{ "node": "Calcular Slots Disponíveis", "type": "Main", "index": 0 }]
+      ],
+      "Calcular Slots Disponíveis": [
+        [{ "node": "Retorno get_available_slots", "type": "Main", "index": 0 }]
+      ]
+    }
+  },
+  "active": false,
+  "settings": { "executionOrder": "v1" },
+  "pinData": {}
+}

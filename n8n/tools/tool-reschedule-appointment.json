@@ -1,0 +1,240 @@
+{
+  "name": "Ferramenta: reschedule_appointment",
+  "nodes": [
+    {
+      "id": "t0040001-0000-4000-8000-000000000001",
+      "name": "Disparar reschedule_appointment",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1,
+      "position": [0, 0],
+      "parameters": {},
+      "notes": "Entrada da ferramenta reschedule_appointment (§4). Argumentos: { appointment_id, wa_id, new_start_at ISO-8601 }."
+    },
+    {
+      "id": "t0040002-0000-4000-8000-000000000002",
+      "name": "Buscar Agendamento Atual",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [250, 0],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT a.id, a.start_at, a.end_at, a.status, a.barber_id, c.wa_id, s.duration_minutes FROM appointments a JOIN clients c ON c.id = a.client_id JOIN services s ON s.id = a.service_id WHERE a.id = $1",
+        "queryParameters": {
+          "values": [
+            { "parameterType": "expression", "value": "={{ $json.appointment_id }}" }
+          ]
+        },
+        "options": {}
+      },
+      "credentials": { "postgres": { "id": "__CRED_POSTGRES_ID__", "name": "Postgres Barbearia" } },
+      "notes": "Carrega o agendamento, o wa_id do cliente e a duração do serviço para validação."
+    },
+    {
+      "id": "t0040003-0000-4000-8000-000000000003",
+      "name": "Validar Regra de Negócio",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [500, 0],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Valida dono do agendamento, status e política de antecedência (2h, §4).\nconst args = $input.first().json || {};\nconst row = $('Buscar Agendamento Atual').first().json || null;\nconst out = { appointment_id: args.appointment_id, wa_id: args.wa_id, new_start_at: args.new_start_at };\nif (!row) return [{ json: { ...out, ok: false, reason: 'agendamento-nao-encontrado' } }];\nif (row.wa_id !== args.wa_id) return [{ json: { ...out, ok: false, reason: 'nao-autorizado', row } }];\nif (!['scheduled', 'confirmed'].includes(row.status)) return [{ json: { ...out, ok: false, reason: 'status-nao-permite-reagendamento', row } }];\nconst limite = new Date(Date.now() + 2 * 3600 * 1000); // CANCEL_MIN_HOURS=2 (ver .env.example)\nconst novo = new Date(args.new_start_at);\nif (novo < limite) return [{ json: { ...out, ok: false, reason: 'Reagendamento exige 2h de antecedência', row } }];\nreturn [{ json: { ...out, ok: true, reason: null, row, duration_minutes: row.duration_minutes } }];"
+      },
+      "notes": "Política de 2h de antecedência (§4); o valor 2 espelha CANCEL_MIN_HOURS=2 do .env.example."
+    },
+    {
+      "id": "t0040004-0000-4000-8000-000000000004",
+      "name": "Buscar Expediente do Novo Horário",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [750, -140],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT closed, open_time, close_time, break_start, break_end FROM working_hours WHERE day_of_week = EXTRACT(DOW FROM $1::date)",
+        "queryParameters": {
+          "values": [
+            { "parameterType": "expression", "value": "={{ $('Validar Regra de Negócio').first().json.new_start_at }}" }
+          ]
+        },
+        "options": {}
+      },
+      "credentials": { "postgres": { "id": "__CRED_POSTGRES_ID__", "name": "Postgres Barbearia" } },
+      "notes": "Expediente do dia do novo horário."
+    },
+    {
+      "id": "t0040005-0000-4000-8000-000000000005",
+      "name": "Validar Novo Horário e Calcular Fim",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1000, 0],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Verifica se o novo horário cabe no expediente e recalcula end_at.\nconst v = $('Validar Regra de Negócio').first().json;\nif (!v.ok) return [{ json: { ...v } }];\nconst exp = $('Buscar Expediente do Novo Horário').first().json;\nif (!exp || exp.closed) return [{ json: { ...v, ok: false, reason: 'fora-expediente' } }];\nfunction paraMin(t) { if (!t) return null; const p = String(t).split(':').map(Number); return p[0] * 60 + p[1]; }\nconst start = new Date(v.new_start_at);\nconst end = new Date(start.getTime() + Number(v.duration_minutes) * 60000);\nconst sMin = start.getHours() * 60 + start.getMinutes();\nconst eMin = end.getHours() * 60 + end.getMinutes();\nif (sMin < paraMin(exp.open_time) || eMin > paraMin(exp.close_time)) return [{ json: { ...v, ok: false, reason: 'duracao-indisponivel' } }];\nconst bIni = paraMin(exp.break_start); const bFim = paraMin(exp.break_end);\nif (bIni !== null && bFim !== null && sMin < bFim && eMin > bIni) return [{ json: { ...v, ok: false, reason: 'fora-expediente' } }];\nreturn [{ json: { ...v, ok: true, end_at: end.toISOString(), barber_id: v.row ? v.row.barber_id : null } }];"
+      },
+      "notes": "Janela dentro do expediente (fora do intervalo de almoço) antes de considerar conflito."
+    },
+    {
+      "id": "t0040006-0000-4000-8000-000000000006",
+      "name": "Verificar Conflito no Novo Horário",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [1250, -140],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT id FROM appointments WHERE id <> $3 AND status IN ('scheduled','confirmed') AND COALESCE(barber_id, 0) = COALESCE($4::integer, 0) AND tstzrange(start_at, end_at, '[)') && tstzrange($1::timestamptz, $2::timestamptz, '[)') LIMIT 1",
+        "queryParameters": {
+          "values": [
+            { "parameterType": "expression", "value": "={{ $('Validar Novo Horário e Calcular Fim').first().json.new_start_at }}" },
+            { "parameterType": "expression", "value": "={{ $('Validar Novo Horário e Calcular Fim').first().json.end_at }}" },
+            { "parameterType": "expression", "value": "={{ $('Validar Novo Horário e Calcular Fim').first().json.appointment_id }}" },
+            { "parameterType": "expression", "value": "={{ $('Validar Novo Horário e Calcular Fim').first().json.barber_id }}" }
+          ]
+        },
+        "options": {}
+      },
+      "credentials": { "postgres": { "id": "__CRED_POSTGRES_ID__", "name": "Postgres Barbearia" } },
+      "notes": "Conflito com outros agendamentos ativos; o próprio agendamento é excluto da comparação (id <> $3)."
+    },
+    {
+      "id": "t0040007-0000-4000-8000-000000000007",
+      "name": "Decisão Reagendamento",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1500, 0],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Consolida validações e marca motivo de bloqueio.\nconst v = $('Validar Novo Horário e Calcular Fim').first().json;\nif (!v.ok) return [{ json: { ...v, motivo: v.reason } }];\nconst conflito = $('Verificar Conflito no Novo Horário').first().json || null;\nconst motivo = (conflito && conflito.id) ? 'conflito' : null;\nreturn [{ json: { ...v, motivo } }];"
+      },
+      "notes": "Se houver conflito, motivo='conflito'; senão o update pode prosseguir."
+    },
+    {
+      "id": "t0040008-0000-4000-8000-000000000008",
+      "name": "Pode Reagendar?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [1750, 0],
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "combinator": "and",
+          "conditions": [
+            { "id": "c1", "leftValue": "={{ $json.motivo }}", "type": "string", "operation": "empty", "rightValue": "" }
+          ]
+        },
+        "options": {}
+      },
+      "notes": "true (motivo vazio) → UPDATE; false → retorno { ok:false, reason }."
+    },
+    {
+      "id": "t0040009-0000-4000-8000-000000000009",
+      "name": "Retorno Erro Reschedule",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [1990, 200],
+      "parameters": {
+        "mode": "manual",
+        "assignments": {
+          "assignments": [
+            { "id": "e1", "name": "ok", "value": "false", "type": "boolean" },
+            { "id": "e2", "name": "reason", "value": "={{ $json.motivo || $json.reason }}", "type": "string" }
+          ]
+        },
+        "options": {}
+      },
+      "notes": "Retorno { ok:false, reason } quando não é possível reagendar."
+    },
+    {
+      "id": "t004000a-0000-4000-8000-00000000000a",
+      "name": "Atualizar Agendamento",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [1990, -160],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE appointments SET start_at = $1, end_at = $2, status = 'scheduled', calendar_sync_status = 'pending', calendar_sync_attempts = 0, updated_at = now() WHERE id = $3 RETURNING id, start_at",
+        "queryParameters": {
+          "values": [
+            { "parameterType": "expression", "value": "={{ $json.new_start_at }}" },
+            { "parameterType": "expression", "value": "={{ $json.end_at }}" },
+            { "parameterType": "expression", "value": "={{ $json.appointment_id }}" }
+          ]
+        },
+        "options": {}
+      },
+      "credentials": { "postgres": { "id": "__CRED_POSTGRES_ID__", "name": "Postgres Barbearia" } },
+      "notes": "Força calendar_sync_status='pending' para o Google Calendar ser recriado na nova hora (§6); tentativas de sync zeradas."
+    },
+    {
+      "id": "t004000b-0000-4000-8000-00000000000b",
+      "name": "Montar Retorno Reschedule",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2230, -160],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const linha = $('Atualizar Agendamento').first().json || {};\nconst v = $('Decisão Reagendamento').first().json;\nreturn [{ json: { ok: true, appointment_id: linha.id || v.appointment_id, start_at: linha.start_at || v.new_start_at } }];"
+      },
+      "notes": "Retorno { ok:true, appointment_id, start_at } (§4)."
+    },
+    {
+      "id": "t004000c-0000-4000-8000-00000000000c",
+      "name": "Retorno Sucesso Reschedule",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [2470, -160],
+      "parameters": {
+        "mode": "manual",
+        "assignments": {
+          "assignments": [
+            { "id": "g1", "name": "ok", "value": "={{ $json.ok }}", "type": "boolean" },
+            { "id": "g2", "name": "appointment_id", "value": "={{ $json.appointment_id }}", "type": "number" },
+            { "id": "g3", "name": "start_at", "value": "={{ $json.start_at }}", "type": "string" }
+          ]
+        },
+        "options": {}
+      },
+      "notes": "Nó final de sucesso da ferramenta reschedule_appointment."
+    }
+  ],
+  "connections": {
+    "Main": {
+      "Disparar reschedule_appointment": [
+        [{ "node": "Buscar Agendamento Atual", "type": "Main", "index": 0 }]
+      ],
+      "Buscar Agendamento Atual": [
+        [{ "node": "Validar Regra de Negócio", "type": "Main", "index": 0 }]
+      ],
+      "Validar Regra de Negócio": [
+        [{ "node": "Buscar Expediente do Novo Horário", "type": "Main", "index": 0 }]
+      ],
+      "Buscar Expediente do Novo Horário": [
+        [{ "node": "Validar Novo Horário e Calcular Fim", "type": "Main", "index": 0 }]
+      ],
+      "Validar Novo Horário e Calcular Fim": [
+        [{ "node": "Verificar Conflito no Novo Horário", "type": "Main", "index": 0 }]
+      ],
+      "Verificar Conflito no Novo Horário": [
+        [{ "node": "Decisão Reagendamento", "type": "Main", "index": 0 }]
+      ],
+      "Decisão Reagendamento": [
+        [{ "node": "Pode Reagendar?", "type": "Main", "index": 0 }]
+      ],
+      "Pode Reagendar?": {
+        "true": [
+          [{ "node": "Atualizar Agendamento", "type": "Main", "index": 0 }]
+        ],
+        "false": [
+          [{ "node": "Retorno Erro Reschedule", "type": "Main", "index": 0 }]
+        ]
+      },
+      "Atualizar Agendamento": [
+        [{ "node": "Montar Retorno Reschedule", "type": "Main", "index": 0 }]
+      ],
+      "Montar Retorno Reschedule": [
+        [{ "node": "Retorno Sucesso Reschedule", "type": "Main", "index": 0 }]
+      ]
+    }
+  },
+  "active": false,
+  "settings": { "executionOrder": "v1" },
+  "pinData": {}
+}

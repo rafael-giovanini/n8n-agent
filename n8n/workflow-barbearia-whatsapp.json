@@ -1,0 +1,360 @@
+{
+  "name": "Barbearia WhatsApp — Agente Bia (Principal)",
+  "nodes": [
+    {
+      "id": "b1000000-0001-4000-8000-000000000001",
+      "name": "Webhook Recebimento WhatsApp",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [-420, 0],
+      "webhookId": "whatsapp-incoming",
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "whatsapp/incoming",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "credentials": {},
+      "notes": "Recebe o POST da ponte Baileys em /webhook/whatsapp/incoming (§2.1 do contrato). O corpo é o payload neutro; a ponte nunca expõe detalhes internos do Baileys. responseMode=responseNode: a resposta HTTP 200 sai do nó 'Responder Webhook'."
+    },
+    {
+      "id": "b1000000-0002-4000-8000-000000000002",
+      "name": "Normalizar Mensagem",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [-170, 0],
+      "parameters": {
+        "mode": "manual",
+        "assignments": {
+          "assignments": [
+            { "id": "a1", "name": "wa_id", "value": "={{ $json.wa_id }}", "type": "string" },
+            { "id": "a2", "name": "sender_name", "value": "={{ $json.sender_name || '' }}", "type": "string" },
+            { "id": "a3", "name": "message_text", "value": "={{ $json.message_text || '' }}", "type": "string" },
+            { "id": "a4", "name": "message_id", "value": "={{ $json.message_id || '' }}", "type": "string" },
+            { "id": "a5", "name": "timestamp", "value": "={{ $json.timestamp || Date.now() }}", "type": "number" }
+          ]
+        },
+        "options": { "keepOnlySet": true }
+      },
+      "notes": "Converte o payload bruto da ponte nos campos usados pelo fluxo: wa_id, sender_name, message_text, message_id e timestamp (§5, nó de normalização). Mantém apenas estes campos para o agente."
+    },
+    {
+      "id": "b1000000-0003-4000-8000-000000000003",
+      "name": "Carregar Estado da Conversa",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [80, 0],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT wa_id, client_id, state_data, last_intent, updated_at FROM conversation_state WHERE wa_id = $1",
+        "queryParameters": {
+          "values": [
+            { "parameterType": "expression", "value": "={{ $json.wa_id }}" }
+          ]
+        },
+        "options": {}
+      },
+      "credentials": {
+        "postgres": { "id": "__CRED_POSTGRES_ID__", "name": "Postgres Barbearia" }
+      },
+      "onError": "continueRegularOutput",
+      "notes": "Busca a memória da conversa na tabela conversation_state (§3.1). Se não houver linha, o nó retorna vazio e o agente inicia uma nova conversa. Requer a credencial 'Postgres Barbearia' (tipo postgres): host db, porta 5432, usuário/senha/banco vindos do .env. onError=continueRegularOutput: falha de conexão/consulta não derruba o webhook; o fluxo segue para a detecção de transferência humana."
+    },
+    {
+      "id": "b1000000-0004-4000-8000-000000000004",
+      "name": "Agente Gemini (Ferramentas)",
+      "type": "n8n-nodes-langchain.agent",
+      "typeVersion": 1.5,
+      "position": [350, 0],
+      "parameters": {
+        "agent": "toolsAgent",
+        "text": "={{ $json.message_text }}",
+        "options": {
+          "systemMessage": "Você é a Bia, atendente virtual acolhedora da barbearia, e responde em português brasileiro. Tom amigável e objetivo, mensagens curtas. Regra de ouro: preços, durações e horários saem exclusivamente das ferramentas; nunca invente valores. Use as ferramentas: list_services, get_available_slots, book_appointment, reschedule_appointment, cancel_appointment e get_my_appointments. Antes de gravar, confirme nome, serviço, data/horário e, se houver preferência, o barbeiro. Se a ferramenta falhar ou o cliente pedir atendente humano, avise que será transferido. Prompt completo: config/agent-prompt.md."
+        }
+      },
+      "credentials": {},
+      "onError": "continueRegularOutput",
+      "notes": "Agente toolsAgent (§5). Conectado ao modelo Gemini gemini-2.0-flash e às 6 ferramentas toolWorkflow (sub-workflows em n8n/tools/). Alternativa documentada no contrato (§4): OpenAI gpt-4o-mini no nó lmChatOpenAI, trocando apenas modelo e credencial, mantendo as mesmas 6 ferramentas. Os placeholders __TOOL_*_ID__ devem ser substituídos pelos IDs reais dos sub-workflows após a importação. onError=continueRegularOutput: erro do modelo ou de uma ferramenta não derruba o webhook; a saída segue para o nó de detecção, que decide a transferência humana."
+    },
+    {
+      "id": "b1000000-0005-4000-8000-000000000005",
+      "name": "Modelo Gemini",
+      "type": "n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1.2,
+      "position": [350, -280],
+      "parameters": {
+        "modelName": "gemini-2.0-flash",
+        "options": {}
+      },
+      "credentials": {
+        "googleGeminiApi": { "id": "__CRED_GEMINI_ID__", "name": "Google Gemini API" }
+      },
+      "notes": "Modelo gemini-2.0-flash (§4). Requer a credencial 'Google Gemini API' (tipo googleGeminiApi) com a API key do Google AI Studio; no JSON a key fica apenas como placeholder, nunca em segredo exposto."
+    },
+    {
+      "id": "b1000000-0006-4000-8000-000000000006",
+      "name": "Ferramenta list_services",
+      "type": "n8n-nodes-langchain.toolWorkflow",
+      "typeVersion": 1.3,
+      "position": [650, -380],
+      "parameters": {
+        "source": "database",
+        "workflowId": "__TOOL_LIST_SERVICES_ID__",
+        "description": "list_services: retorna os serviços ativos com service_id, nome, descrição, duration_minutes e preço (§4).",
+        "workflowInputs": { "values": [] },
+        "additionalFields": {}
+      },
+      "notes": "Função list_services (§4). Sub-workflow: n8n/tools/tool-list-services.json. Substituir __TOOL_LIST_SERVICES_ID__ pelo ID real após importar o sub-workflow."
+    },
+    {
+      "id": "b1000000-0007-4000-8000-000000000007",
+      "name": "Ferramenta get_available_slots",
+      "type": "n8n-nodes-langchain.toolWorkflow",
+      "typeVersion": 1.3,
+      "position": [650, -290],
+      "parameters": {
+        "source": "database",
+        "workflowId": "__TOOL_AVAILABLE_SLOTS_ID__",
+        "description": "get_available_slots: args {service_id, date, barber_id}; retorna slots do dia respeitando expediente, intervalo e sobreposições (§4).",
+        "workflowInputs": { "values": [] },
+        "additionalFields": {}
+      },
+      "notes": "Função get_available_slots (§4). Sub-workflow: n8n/tools/tool-available-slots.json. Substituir __TOOL_AVAILABLE_SLOTS_ID__ pelo ID real."
+    },
+    {
+      "id": "b1000000-0008-4000-8000-000000000008",
+      "name": "Ferramenta book_appointment",
+      "type": "n8n-nodes-langchain.toolWorkflow",
+      "typeVersion": 1.3,
+      "position": [650, -200],
+      "parameters": {
+        "source": "database",
+        "workflowId": "__TOOL_BOOK_APPOINTMENT_ID__",
+        "description": "book_appointment: args {wa_id, client_name, service_id, barber_id, start_at}; grava o agendamento com calendar_sync_status='pending' (§4).",
+        "workflowInputs": { "values": [] },
+        "additionalFields": {}
+      },
+      "notes": "Função book_appointment (§4). Sub-workflow: n8n/tools/tool-book-appointment.json. Substituir __TOOL_BOOK_APPOINTMENT_ID__ pelo ID real."
+    },
+    {
+      "id": "b1000000-0009-4000-8000-000000000009",
+      "name": "Ferramenta reschedule_appointment",
+      "type": "n8n-nodes-langchain.toolWorkflow",
+      "typeVersion": 1.3,
+      "position": [650, -110],
+      "parameters": {
+        "source": "database",
+        "workflowId": "__TOOL_RESCHEDULE_ID__",
+        "description": "reschedule_appointment: args {appointment_id, wa_id, new_start_at}; valida política de 2h e disponibilidade (§4).",
+        "workflowInputs": { "values": [] },
+        "additionalFields": {}
+      },
+      "notes": "Função reschedule_appointment (§4). Sub-workflow: n8n/tools/tool-reschedule-appointment.json. Substituir __TOOL_RESCHEDULE_ID__ pelo ID real."
+    },
+    {
+      "id": "b1000000-000a-4000-8000-00000000000a",
+      "name": "Ferramenta cancel_appointment",
+      "type": "n8n-nodes-langchain.toolWorkflow",
+      "typeVersion": 1.3,
+      "position": [650, -20],
+      "parameters": {
+        "source": "database",
+        "workflowId": "__TOOL_CANCEL_ID__",
+        "description": "cancel_appointment: args {appointment_id, wa_id, reason}; cancelamento exige 2h de antecedência (§4).",
+        "workflowInputs": { "values": [] },
+        "additionalFields": {}
+      },
+      "notes": "Função cancel_appointment (§4). Sub-workflow: n8n/tools/tool-cancel-appointment.json. Substituir __TOOL_CANCEL_ID__ pelo ID real."
+    },
+    {
+      "id": "b1000000-000b-4000-8000-00000000000b",
+      "name": "Ferramenta get_my_appointments",
+      "type": "n8n-nodes-langchain.toolWorkflow",
+      "typeVersion": 1.3,
+      "position": [650, 70],
+      "parameters": {
+        "source": "database",
+        "workflowId": "__TOOL_MY_APPOINTMENTS_ID__",
+        "description": "get_my_appointments: args {wa_id}; lista os agendamentos ativos do cliente (§4).",
+        "workflowInputs": { "values": [] },
+        "additionalFields": {}
+      },
+      "notes": "Função get_my_appointments (§4). Sub-workflow: n8n/tools/tool-my-appointments.json. Substituir __TOOL_MY_APPOINTMENTS_ID__ pelo ID real."
+    },
+    {
+      "id": "b1000000-000c-4000-8000-00000000000c",
+      "name": "Salvar Estado da Conversa",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [610, 0],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO conversation_state (wa_id, client_id, state_data, last_intent, updated_at) VALUES ($1, $2, $3::jsonb, $4, now()) ON CONFLICT (wa_id) DO UPDATE SET client_id = EXCLUDED.client_id, state_data = EXCLUDED.state_data, last_intent = EXCLUDED.last_intent, updated_at = now()",
+        "queryParameters": {
+          "values": [
+            { "parameterType": "expression", "value": "={{ $('Normalizar Mensagem').first().json.wa_id }}" },
+            { "parameterType": "expression", "value": "={{ $json.client_id || null }}" },
+            { "parameterType": "expression", "value": "={{ JSON.stringify({ ultima_mensagem: $('Normalizar Mensagem').first().json.message_text || '', atualizado_em: new Date().toISOString() }) }}" },
+            { "parameterType": "expression", "value": "={{ $json.last_intent || null }}" }
+          ]
+        },
+        "options": {}
+      },
+      "credentials": {
+        "postgres": { "id": "__CRED_POSTGRES_ID__", "name": "Postgres Barbearia" }
+      },
+      "onError": "continueRegularOutput",
+      "notes": "Upsert na tabela conversation_state ao final do turno (§5). Guarda o JSONB do estado e a última intenção; requer a credencial 'Postgres Barbearia'. onError=continueRegularOutput: se a gravação falhar, o fluxo continua até a resposta em vez de quebrar o webhook."
+    },
+    {
+      "id": "b1000000-0012-4000-8000-000000000012",
+      "name": "Detectar Pedido de Humano e Erro",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [850, 0],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Extrai o texto da saída do agente e decide se a conversa deve ir para humano.\nconst agente = $('Agente Gemini (Ferramentas)').first().json || {};\nlet texto = agente.output || '';\nif (!texto && agente.message) {\n  const conteudo = agente.message.content;\n  texto = typeof conteudo === 'string' ? conteudo : (Array.isArray(conteudo) ? conteudo.map(p => p.text || '').join('') : '');\n}\nif (!texto) texto = agente.text || '';\nconst norma = $('Normalizar Mensagem').first().json || {};\nconst regexPedido = /atendente|falar com (um|uma|algu[ée]m)|pessoa|humano/i;\nlet handoff = regexPedido.test(texto);\nlet handoffReason = handoff ? 'Pedido de atendente humano' : null;\nif (!texto) {\n  handoff = true;\n  handoffReason = 'Falha interna do atendimento automático';\n}\nlet responseText = texto;\nif (!responseText) {\n  responseText = 'Desculpe, não consegui processar sua mensagem agora. Vou transferir você para um atendente.';\n}\nreturn [{ json: { wa_id: norma.wa_id, responseText, handoff, handoffReason } }];"
+      },
+      "notes": "Ponte de decisão (§5 e prompt §10 regra de transferência): extrai o texto da resposta do agente e marca handoff=true quando o cliente pede atendente/pessoa/humano (palavras-chave) ou quando a saída do agente vem vazia por falha de nó/ferramenta. handoffReason registra o motivo no ticket; responseText alimenta os dois nós de montagem de resposta."
+    },
+    {
+      "id": "b1000000-000d-4000-8000-00000000000d",
+      "name": "Verificar Erro",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [1110, 0],
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "combinator": "and",
+          "conditions": [
+            { "id": "c1", "leftValue": "={{ $json.handoff }}", "type": "boolean", "operation": "true", "rightValue": "" }
+          ]
+        },
+        "options": {}
+      },
+      "notes": "Ramifica o fluxo pelo flag handoff do nó de detecção: true (pedido de atendente ou falha/saída vazia) → registrar ticket em human_tickets e fallback com human_handoff=true; false (resposta automática normal) → Montar Resposta Final com human_handoff=false."
+    },
+    {
+      "id": "b1000000-000e-4000-8000-00000000000e",
+      "name": "Montar Resposta Final",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1100, -150],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Rama sem transferência (handoff=false): consolida a resposta no formato §2.2.\nconst deteccao = $('Detectar Pedido de Humano e Erro').first().json || {};\nconst norma = $('Normalizar Mensagem').first().json || {};\nconst texto = deteccao.responseText || 'Oi! Como posso ajudar você hoje?';\nreturn [{ json: { messages: [{ to: deteccao.wa_id || norma.wa_id, type: 'text', text: texto }], human_handoff: false } }];"
+      },
+      "notes": "Rama de sucesso (handoff=false): monta { messages: [...], human_handoff: false } conforme §2.2. Usa o responseText já normalizado pelo nó de detecção; messages[0].to usa o wa_id da mensagem normalizada."
+    },
+    {
+      "id": "b1000000-000f-4000-8000-00000000000f",
+      "name": "Registrar Ticket Humano",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [1100, 150],
+      "parameters": {
+        "operation": "insert",
+        "table": "human_tickets",
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "wa_id": "={{ $('Normalizar Mensagem').first().json.wa_id }}",
+            "name": "={{ $('Normalizar Mensagem').first().json.sender_name || '' }}",
+            "reason": "={{ $json.handoffReason || 'Pedido de atendente humano' }}"
+          },
+          "matchingColumns": []
+        },
+        "options": {}
+      },
+      "credentials": {
+        "postgres": { "id": "__CRED_POSTGRES_ID__", "name": "Postgres Barbearia" }
+      },
+      "notes": "Rama de transferência (handoff=true): insere linha em human_tickets com status padrão 'open' (§3.1). O reason vem do nó de detecção ('Pedido de atendente humano' quando o cliente pediu, ou 'Falha interna do atendimento automático' quando houve erro/saída vazia). Requer a credencial 'Postgres Barbearia'."
+    },
+    {
+      "id": "b1000000-0010-4000-8000-000000000010",
+      "name": "Montar Fallback Humano",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1340, 150],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Rama humana (handoff=true): mensagem de transferência com human_handoff=true (§2.2).\nconst deteccao = $('Detectar Pedido de Humano e Erro').first().json || {};\nconst norma = $('Normalizar Mensagem').first().json || {};\nconst fallbackPadrao = 'Oi! No momento estou com uma instabilidade e já estou transferindo você para um atendente humano. Por favor, aguarde alguns instantes que alguém vai te responder.';\nconst texto = deteccao.responseText || fallbackPadrao;\nreturn [{ json: { messages: [{ to: deteccao.wa_id || norma.wa_id, type: 'text', text: texto }], human_handoff: true } }];"
+      },
+      "notes": "Rama handoff=true: usa o responseText do nó de detecção quando houver texto do agente (ex.: resposta ao pedido de atendente); senão aplica a mensagem padrão de instabilidade. Sinaliza human_handoff=true; a ponte envia o texto e a pendência fica registrada em human_tickets."
+    },
+    {
+      "id": "b1000000-0011-4000-8000-000000000011",
+      "name": "Responder Webhook",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [1580, 0],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ $json }}",
+        "options": { "responseCode": 200, "responseHeaders": [] }
+      },
+      "notes": "Devolve HTTP 200 com o JSON consolidado (messages + human_handoff) no formato §2.2. É alcançado tanto pela rama de sucesso quanto pela rama de fallback humano."
+    }
+  ],
+  "connections": {
+    "Main": {
+      "Webhook Recebimento WhatsApp": [
+        [{ "node": "Normalizar Mensagem", "type": "Main", "index": 0 }]
+      ],
+      "Normalizar Mensagem": [
+        [{ "node": "Carregar Estado da Conversa", "type": "Main", "index": 0 }]
+      ],
+      "Carregar Estado da Conversa": [
+        [{ "node": "Agente Gemini (Ferramentas)", "type": "Main", "index": 0 }]
+      ],
+      "Agente Gemini (Ferramentas)": [
+        [{ "node": "Salvar Estado da Conversa", "type": "Main", "index": 0 }]
+      ],
+      "Salvar Estado da Conversa": [
+        [{ "node": "Detectar Pedido de Humano e Erro", "type": "Main", "index": 0 }]
+      ],
+      "Detectar Pedido de Humano e Erro": [
+        [{ "node": "Verificar Erro", "type": "Main", "index": 0 }]
+      ],
+      "Verificar Erro": {
+        "true": [
+          [{ "node": "Registrar Ticket Humano", "type": "Main", "index": 0 }]
+        ],
+        "false": [
+          [{ "node": "Montar Resposta Final", "type": "Main", "index": 0 }]
+        ]
+      },
+      "Registrar Ticket Humano": [
+        [{ "node": "Montar Fallback Humano", "type": "Main", "index": 0 }]
+      ],
+      "Montar Resposta Final": [
+        [{ "node": "Responder Webhook", "type": "Main", "index": 0 }]
+      ],
+      "Montar Fallback Humano": [
+        [{ "node": "Responder Webhook", "type": "Main", "index": 0 }]
+      ]
+    },
+    "ai_languageModel": {
+      "Agente Gemini (Ferramentas)": [
+        [{ "node": "Modelo Gemini", "type": "ai_languageModel", "index": 0 }]
+      ]
+    },
+    "ai_tool": {
+      "Agente Gemini (Ferramentas)": [
+        [{ "node": "Ferramenta list_services", "type": "ai_tool", "index": 0 }],
+        [{ "node": "Ferramenta get_available_slots", "type": "ai_tool", "index": 0 }],
+        [{ "node": "Ferramenta book_appointment", "type": "ai_tool", "index": 0 }],
+        [{ "node": "Ferramenta reschedule_appointment", "type": "ai_tool", "index": 0 }],
+        [{ "node": "Ferramenta cancel_appointment", "type": "ai_tool", "index": 0 }],
+        [{ "node": "Ferramenta get_my_appointments", "type": "ai_tool", "index": 0 }]
+      ]
+    }
+  },
+  "active": false,
+  "settings": { "executionOrder": "v1" },
+  "pinData": {}
+}

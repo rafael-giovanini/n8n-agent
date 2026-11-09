@@ -1,0 +1,68 @@
+# =============================================================================
+# docker-compose.yml — Pilha da barbearia: PostgreSQL 15 + n8n (§11 do contrato)
+# Idioma: pt-BR.
+# Uso:
+#   1) cp .env.example .env e ajuste os placeholders
+#   2) docker compose up -d
+#   3) Aplicar o banco:
+#      docker exec -i barbearia-db psql -U ${POSTGRES_USER:-barb_user} -d ${POSTGRES_DB:-barbearia} < database/schema.sql
+#      docker exec -i barbearia-db psql -U ${POSTGRES_USER:-barb_user} -d ${POSTGRES_DB:-barbearia} < database/seed.sql
+# =============================================================================
+
+services:
+  # Banco de dados PostgreSQL (schema em database/schema.sql, seed em database/seed.sql)
+  db:
+    image: postgres:15-alpine
+    container_name: barbearia-db
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-barb_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-__TROCAR_SENHA_BANCO__}
+      POSTGRES_DB: ${POSTGRES_DB:-barbearia}
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-barb_user} -d ${POSTGRES_DB:-barbearia}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
+  # n8n: importar os workflows de n8n/ e sub-workflows de n8n/tools/ pela interface
+  n8n:
+    image: n8nio/n8n:latest
+    container_name: barbearia-n8n
+    ports:
+      - "${N8N_PORT:-5678}:5678"
+    environment:
+      # Conexão com o PostgreSQL interno da pilha
+      DB_TYPE: postgresdb
+      DB_POSTGRESDB_HOST: db
+      DB_POSTGRESDB_PORT: 5432
+      DB_POSTGRESDB_USER: ${POSTGRES_USER:-barb_user}
+      DB_POSTGRESDB_PASSWORD: ${POSTGRES_PASSWORD:-__TROCAR_SENHA_BANCO__}
+      DB_POSTGRESDB_DATABASE: ${POSTGRES_DB:-barbearia}
+      # Chave de criptografia das credenciais armazenadas no n8n (trocar obrigatoriamente)
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY:-__TROCAR_CHAVE_ALEATORIA__}
+      GENERIC_TIMEZONE: America/Sao_Paulo
+      TZ: America/Sao_Paulo
+      # Dados do negócio usados nas mensagens/FAQ (acessíveis por $env nos workflows)
+      BUSINESS_NAME: ${BUSINESS_NAME:-Barbearia Exemplo}
+      BUSINESS_ADDRESS: ${BUSINESS_ADDRESS:-__ENDERECO_EXEMPLO__}
+      BUSINESS_HOURS_TEXT: ${BUSINESS_HOURS_TEXT:-Terça a Sábado, 09h às 19h}
+      PIX_CHAVE: ${PIX_CHAVE:-__CHAVE_PIX_EXEMPLO__}
+      # Regras de negócio de agendamento
+      CANCEL_MIN_HOURS: ${CANCEL_MIN_HOURS:-2}
+      SLOT_INTERVAL_MINUTES: ${SLOT_INTERVAL_MINUTES:-30}
+    volumes:
+      - n8n_data:/home/node/.n8n
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  pg_data:
+  n8n_data:
